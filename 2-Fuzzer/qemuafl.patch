@@ -1,0 +1,191 @@
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/accel/tcg/translate-all.c qemuafl/accel/tcg/translate-all.c
+--- ../for_patch/qemuafl/accel/tcg/translate-all.c	2025-12-27 15:04:04.038941699 -0700
++++ qemuafl/accel/tcg/translate-all.c	2025-12-29 16:19:40.305765888 -0700
+@@ -69,6 +69,8 @@
+ 
+ #include <math.h>
+ 
++#include "Binv_instrument.h"
++
+ __thread int cur_block_is_good;
+ 
+ static int afl_track_unstable_log_fd(void) {
+@@ -2014,6 +2016,118 @@
+     return tb;
+ }
+ 
++static inline void viol_snippet(uint32_t inv_id) {
++    /* afl_area_ptr[inv_id]++ */
++    TCGv_ptr invs_bitmap_ind_ptr = tcg_const_ptr(&afl_area_ptr[inv_id]);
++    TCGv_i32 invs_bit_ind = tcg_temp_new_i32();
++    tcg_gen_ld8u_i32(invs_bit_ind, invs_bitmap_ind_ptr, 0);
++    tcg_gen_add_i32(invs_bit_ind, invs_bit_ind, tcg_constant_i32(1));
++    tcg_gen_st8_i32(invs_bit_ind, invs_bitmap_ind_ptr, 0);
++    tcg_temp_free_i32(invs_bit_ind);
++}
++
++void Binv_add_invChecks(size_t cur_invs_cnt, uint16_t *cur_invs, struct binv_offsets *bo, uint32_t pc_hash) {
++    size_t regs_offset = bo->regs_offset;
++    size_t stride = bo->stride;
++
++    for (int i = 0; i < cur_invs_cnt; i++) {
++        if (cur_invs[i] == 0xFFFF) continue;
++        uint16_t reg1_Id;
++
++        __asm__(                    // reg_id = (cur_invs[i] >> 2) & 0x0F;
++            "mov %1, %w0\n\t"
++            "shr $2, %w0\n\t"
++            "and $0x0F, %w0\n\t"
++            : "=r"(reg1_Id)
++            : "r"(cur_invs[i])
++            : "cc"
++        );
++
++        if (!(cur_invs[i] & 1)) {
++
++            uint16_t cur_op, reg2_Id;
++
++            __asm__(                // op = (cur_invs[i] >> 6) & 0b111;
++                "mov %1, %w0\n\t"
++                "shr $6, %w0\n\t"
++                "and $0x07, %w0\n\t"
++                : "=r"(cur_op)
++                : "r"(cur_invs[i])
++                : "cc"
++            );
++            __asm__(                // reg2_id = (cur_invs[i] >> 9) & 0b1111;
++                "mov %1, %w0\n\t"
++                "shr $9, %w0\n\t"
++                "and $0x0F, %w0\n\t"
++                : "=r"(reg2_Id)
++                : "r"(cur_invs[i])
++                : "cc"
++            );
++
++
++            TCGv_i64 r1_val = tcg_temp_new_i64();
++            tcg_gen_ld_i64(r1_val, cpu_env, regs_offset + reg1_Id * stride);
++
++            TCGv_i64 r2_val = tcg_temp_new_i64();
++            tcg_gen_ld_i64(r2_val, cpu_env, regs_offset + reg2_Id * stride);
++            
++            TCGLabel *L_not_voil = gen_new_label();
++
++            /* check reg1 [OP] reg2: if (reg1 [OP] reg2) goto L_not_voil; */
++            if (cur_op == EQUAL) {
++                tcg_gen_brcond_i64(TCG_COND_EQ, r1_val, r2_val, L_not_voil);
++            } else if (cur_op == LESS) {
++                tcg_gen_brcond_i64(TCG_COND_LTU, r1_val, r2_val, L_not_voil);
++            } else if (cur_op == LESSEQUAL) {
++                tcg_gen_brcond_i64(TCG_COND_LEU, r1_val, r2_val, L_not_voil);
++            } else if (cur_op == GREATER) {
++                tcg_gen_brcond_i64(TCG_COND_GTU, r1_val, r2_val, L_not_voil);
++            } else if (cur_op == GREATEREQUAL) {
++                tcg_gen_brcond_i64(TCG_COND_GEU, r1_val, r2_val, L_not_voil);
++            } else {
++                tcg_gen_brcond_i64(TCG_COND_NE, r1_val, r2_val, L_not_voil);
++            }
++            
++            uint32_t inv_id = ((reg1_Id & 0x0F) << 4) | (reg2_Id & 0x0F);
++            inv_id ^= pc_hash;
++            viol_snippet(inv_id);
++
++            gen_set_label(L_not_voil);
++            tcg_temp_free_i64(r1_val);
++            tcg_temp_free_i64(r2_val);
++        } else {
++            uint64_t valRange[2] = {0};
++            regValRange(&cur_invs[i], valRange);
++
++            TCGv_i64 min_v = tcg_constant_i64(valRange[0]);
++            TCGv_i64 max_v = tcg_constant_i64(valRange[1]);
++
++            TCGv_i64 reg_val = tcg_temp_new_i64();
++            tcg_gen_ld_i64(reg_val, cpu_env, regs_offset + reg1_Id * stride);
++
++            TCGLabel *L_not_voil = gen_new_label();
++
++            /* check min <= reg_val <= max */
++            TCGv_i64 min_cond = tcg_temp_new_i64();
++            tcg_gen_setcond_i64(TCG_COND_GEU, min_cond, reg_val, min_v);
++            TCGv_i64 max_cond = tcg_temp_new_i64();
++            tcg_gen_setcond_i64(TCG_COND_LEU, max_cond, reg_val, max_v);
++            
++            TCGv_i64 both_cond = tcg_temp_new_i64();
++            tcg_gen_and_i64(both_cond, min_cond, max_cond);
++            /* if (min <= reg_val <= max) goto L_not_voil; */
++            tcg_gen_brcond_i64(TCG_COND_EQ, both_cond, tcg_constant_i64(1), L_not_voil);
++
++            uint32_t inv_id = ((reg1_Id & 0x0F) << 4) | (reg1_Id & 0x0F);
++            inv_id ^= pc_hash;
++            viol_snippet(inv_id);
++            
++            gen_set_label(L_not_voil);
++            tcg_temp_free_i64(reg_val);
++        }
++    }
++}
++
+ /* Called with mmap_lock held for user mode emulation.  */
+ TranslationBlock *tb_gen_code(CPUState *cpu,
+                               target_ulong pc, target_ulong cs_base,
+@@ -2090,6 +2204,27 @@
+ 
+     tcg_ctx->cpu = env_cpu(env);
+     afl_gen_trace(pc);
++
++    uint32_t cur_pc_hash = afl_hash_ip(pc);
++    cur_pc_hash &= (MAP_SIZE - 1);
++
++    if (tb->pc >= min_tb_addr && tb->pc <= max_tb_addr) {
++        for (size_t i = 0; i < tb_count; i++) {
++            TBEntry *e = &entries[i];
++
++            if (e->tbaddr == tb->pc) {
++
++                struct binv_offsets bo;
++            
++                bo.regs_offset = offsetof(CPUArchState, regs);
++                bo.stride = sizeof(((CPUArchState*)0)->regs[0]);
++
++                Binv_add_invChecks(e->n_bytes, e->bytes, &bo, cur_pc_hash);
++                break;
++            }
++        }
++    }
++
+     gen_intermediate_code(cpu, tb, max_insns);
+     tcg_ctx->cpu = NULL;
+     max_insns = tb->icount;
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/linux-user/main.c qemuafl/linux-user/main.c
+--- ../for_patch/qemuafl/linux-user/main.c	2025-12-27 15:04:03.863940306 -0700
++++ qemuafl/linux-user/main.c	2025-12-29 09:42:10.851643882 -0700
+@@ -51,6 +51,8 @@
+ 
+ #include "qemuafl/qasan-qemu.h"
+ 
++#include "Binv_instrument.h"
++
+ char *exec_path;
+ 
+ int singlestep;
+@@ -965,6 +967,8 @@
+     syscall_init();
+     signal_init();
+ 
++    Binv_init();
++
+     /* Now that we've loaded the binary, GUEST_BASE is fixed.  Delay
+        generating the prologue until now so that the prologue can take
+        the real value of GUEST_BASE into account.  */
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/linux-user/meson.build qemuafl/linux-user/meson.build
+--- ../for_patch/qemuafl/linux-user/meson.build	2025-12-27 15:04:03.863940306 -0700
++++ qemuafl/linux-user/meson.build	2025-12-29 09:42:31.866046059 -0700
+@@ -11,6 +11,7 @@
+   'syscall.c',
+   'uaccess.c',
+   'uname.c',
++  'Binv_instrument.c',
+ ))
+ linux_user_ss.add(rt)
+ 

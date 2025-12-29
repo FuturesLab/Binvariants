@@ -1,0 +1,691 @@
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/accel/tcg/cpu-exec.c qemuafl/accel/tcg/cpu-exec.c
+--- ../for_patch/qemuafl/accel/tcg/cpu-exec.c	2025-12-27 15:04:04.037941691 -0700
++++ qemuafl/accel/tcg/cpu-exec.c	2025-12-28 21:30:08.740176656 -0700
+@@ -54,6 +54,8 @@
+   #include <dlfcn.h>
+ #endif
+ 
++#include "Binvariants_qemu.h"
++
+ /***************************
+  * VARIOUS AUXILIARY STUFF *
+  ***************************/
+@@ -113,6 +115,10 @@
+ static void afl_wait_tsl(CPUState *, int);
+ static void afl_request_tsl(target_ulong, target_ulong, uint32_t, uint32_t,
+                             TranslationBlock *, int);
++static void binv_wait_tsl_or_update_invs(CPUState *, int);
++static void binv_request_tsl(target_ulong, target_ulong, uint32_t, uint32_t,
++                            TranslationBlock *, int, CPUState *, TranslationBlock *);
++static void binv_send_whole(int fd, enum binv_msg_type type, const void *m);
+ 
+ /* Data structures passed around by the translate handlers: */
+ 
+@@ -138,7 +144,28 @@
+   struct afl_tb tb;
+   struct afl_chain chain;
+   char is_chain;
++  uint64_t reg_values[16];
++  uint8_t need_regs;
++  uint8_t acc_regs_array[16];
++  uint8_t acc_regs_cnt;
++  uint16_t binv_id;
++
++};
++
++struct binv_invs {
++  uint16_t binv_id;
++  uint16_t invs[MAX_INVS_PER_TB];
++  uint8_t invs_cnt;
++};
++
++struct __attribute__((packed)) binv_msg_tsl {
++    struct binv_msg_hdr hdr;
++    struct afl_tsl payload;
++};
+ 
++struct __attribute__((packed)) binv_msg_binv {
++    struct binv_msg_hdr hdr;
++    struct binv_invs payload;
+ };
+ 
+ /* Some forward decls: */
+@@ -665,6 +692,7 @@
+   if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+ 
+   afl_forksrv_pid = getpid();
++  BINVARIANTS_QEMU_INIT_SNIPPET;
+ 
+   int first_run = 1;
+ 
+@@ -748,12 +776,14 @@
+ 
+     /* Collect translation requests until child dies and closes the pipe. */
+ 
+-    afl_wait_tsl(cpu, t_fd[0]);
++    binv_wait_tsl_or_update_invs(cpu, t_fd[0]);
+ 
+     /* Get and relay exit status to parent. */
+ 
+     if (waitpid(child_pid, &status, is_persistent ? WUNTRACED : 0) < 0) exit(6);
+ 
++    binv_log_all_invs();
++
+     /* In persistent mode, the child stops itself with SIGSTOP to indicate
+        a successful run. In this case, we want to wake it up without forking
+        again. */
+@@ -985,7 +1015,7 @@
+       if (is_valid_addr(t.tb.pc)) {
+ 
+         mmap_lock();
+-        tb = tb_gen_code(cpu, t.tb.pc, t.tb.cs_base, t.tb.flags, t.tb.cf_mask);
++        tb = tb_gen_code(cpu, t.tb.pc, t.tb.cs_base, t.tb.flags, t.tb.cf_mask, NULL, NULL);
+         mmap_unlock();
+ 
+       } else {
+@@ -1018,6 +1048,201 @@
+ 
+ }
+ 
++static inline void binv_wait_tsl(CPUState *cpu, struct afl_tsl t) {
++  TranslationBlock *tb, *last_tb;
++  u8 invalid_pc = 0;
++
++  tb = afl_tb_lookup(cpu, t.tb.pc, t.tb.cs_base, t.tb.flags, t.tb.cf_mask);
++
++  if (!tb) {
++    if (is_valid_addr(t.tb.pc)) {
++      struct binv_args ba;
++
++      mmap_lock();
++      if (Binv_qemu_initialized) {
++        if (t.need_regs) {
++          ba.cur_reg_values = t.reg_values;
++          ba.cur_acc_regs_array = t.acc_regs_array;
++          ba.cur_acc_regs_cnt = t.acc_regs_cnt;
++          ba.cur_binv_id = t.binv_id;
++        }
++      }
++
++      if (t.need_regs) {
++        tb = tb_gen_code(cpu, t.tb.pc, t.tb.cs_base, t.tb.flags, t.tb.cf_mask, &ba, NULL);
++      } else {
++        tb = tb_gen_code(cpu, t.tb.pc, t.tb.cs_base, t.tb.flags, t.tb.cf_mask, NULL, NULL);
++      }
++      
++      tb->acc_regs_array = NULL;
++      mmap_unlock();
++
++    } else {
++
++      invalid_pc = 1;
++
++    }
++  }
++
++  if (t.is_chain && !invalid_pc) {
++
++    last_tb = afl_tb_lookup(cpu, t.chain.last_tb.pc,
++                               t.chain.last_tb.cs_base,
++                               t.chain.last_tb.flags,
++                               t.chain.cf_mask);
++#define TB_JMP_RESET_OFFSET_INVALID 0xffff
++      if (last_tb && (last_tb->jmp_reset_offset[t.chain.tb_exit] !=
++                      TB_JMP_RESET_OFFSET_INVALID)) {
++
++        tb_add_jump(last_tb, t.chain.tb_exit, tb);
++
++      }
++
++  }
++}
++
++static inline void binv_wait_update_invs(CPUState *cpu, struct binv_invs b) {
++  BinvariantsTB *curtb_binvTB = &binvTB[b.binv_id];
++  curtb_binvTB->invs_cnt = b.invs_cnt;
++  memcpy(curtb_binvTB->invs, b.invs, b.invs_cnt * sizeof(uint16_t));
++}
++
++static inline ssize_t read_exact(int fd, void *buf, size_t len) {
++    size_t got = 0;
++    while (got < len) {
++        ssize_t r = read(fd, (char*)buf + got, len - got);
++        if (r <= 0) return r;
++        got += r;
++    }
++    return got;
++}
++
++static inline void write_exact(int fd, const void *buf, size_t n) {
++  const uint8_t *p = buf;
++  while (n) {
++      ssize_t w = write(fd, p, n);
++      if (w <= 0) perror("write"), exit(1);
++      p += w; n -= w;
++  }
++}
++
++void binv_send_whole(int fd, enum binv_msg_type type, const void *m) {
++  if (type == MSG_TSL) {
++    struct binv_msg_tsl msg;
++    
++    msg.hdr.type = MSG_TSL;
++    msg.hdr.len  = htons(sizeof(struct afl_tsl));
++    msg.payload  = *(const struct afl_tsl *)m;
++
++    write_exact(fd, &msg, sizeof(msg));
++  } else {
++    struct binv_msg_binv msg;
++    
++    msg.hdr.type = MSG_BINV;
++    msg.hdr.len  = htons(sizeof(struct binv_invs));
++    msg.payload  = *(const struct binv_invs *)m;
++
++    write_exact(fd, &msg, sizeof(msg));
++  }
++}
++
++static void binv_wait_tsl_or_update_invs(CPUState *cpu, int fd) {
++  while (1) {
++    struct binv_msg_hdr hdr;
++    if (read_exact(fd, &hdr, sizeof(struct binv_msg_hdr)) != sizeof(struct binv_msg_hdr)) break;
++
++    uint16_t payload_len = ntohs(hdr.len);
++    void *payload = malloc(payload_len);
++    if (!payload) {
++      perror("malloc");
++      break;
++    }
++
++    if (read_exact(fd, payload, payload_len) != payload_len) {
++      free(payload);
++      break;
++    }
++
++    if (hdr.type == MSG_TSL) {
++      struct afl_tsl *t_ptr = (struct afl_tsl *)payload;
++      if (t_ptr->tb.pc == (target_ulong)-1) {
++        free(payload);
++        close(fd);
++        return;
++      }
++      binv_wait_tsl(cpu, *t_ptr);
++    } else if (hdr.type == MSG_BINV) {
++      struct binv_invs *b_ptr = (struct binv_invs *)payload;
++      binv_wait_update_invs(cpu, *b_ptr);
++    } else {
++      // pass
++    }
++    free(payload);
++  }
++  close(fd);
++}
++
++static void binv_request_tsl(target_ulong pc, target_ulong cb, uint32_t flags,
++                            uint32_t cf_mask, TranslationBlock *last_tb,
++                            int tb_exit, CPUState *cpu, TranslationBlock *cur_tb) {
++  if (disable_caching) return;
++
++  struct afl_tsl t;
++
++  if (!afl_fork_child) return;
++
++  t.tb.pc = pc;
++  t.tb.cs_base = cb;
++  t.tb.flags = flags;
++  t.tb.cf_mask = cf_mask;
++  t.is_chain = (last_tb != NULL);
++  t.need_regs = 0;
++  t.acc_regs_cnt = 0;
++  memset(t.acc_regs_array, 0, sizeof t.acc_regs_array);
++
++  if (Binv_qemu_initialized) {
++    if (cur_tb->binv_id && cur_tb->acc_regs_array && cur_tb->acc_regs_cnt) {
++      CPUArchState *env = cpu->env_ptr;
++
++      t.need_regs = 1;
++      t.binv_id = cur_tb->binv_id;
++
++      for (int i = 0; i < NUM_REGS; i++) {
++        t.reg_values[i] = env->regs[i];
++      }
++
++      memcpy(t.acc_regs_array, cur_tb->acc_regs_array, cur_tb->acc_regs_cnt * sizeof(uint8_t));
++      t.acc_regs_cnt = cur_tb->acc_regs_cnt;
++
++      free(cur_tb->acc_regs_array);
++      cur_tb->acc_regs_array = NULL;
++    }
++  }
++
++  if (t.is_chain) {
++
++    t.chain.last_tb.pc = last_tb->pc;
++    t.chain.last_tb.cs_base = last_tb->cs_base;
++    t.chain.last_tb.flags = last_tb->flags;
++    t.chain.cf_mask = cf_mask;
++    t.chain.tb_exit = tb_exit;
++
++  }
++  
++  binv_send_whole(TSL_FD, MSG_TSL, &t);
++}
++
++/* reflect updated invs to QEMU parent*/
++void binv_request_update_invs(BinvariantsTB *curtb_binvTB) {
++  struct binv_invs b;
++
++  b.binv_id = curtb_binvTB->binv_id;
++  b.invs_cnt = curtb_binvTB->invs_cnt;
++  memcpy(b.invs, curtb_binvTB->invs, b.invs_cnt * sizeof(uint16_t));
++
++  binv_send_whole(TSL_FD, MSG_BINV, &b);
++}
++
+ /* -icount align implementation. */
+ 
+ typedef struct SyncClocks {
+@@ -1235,7 +1460,7 @@
+         tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask);
+         if (tb == NULL) {
+             mmap_lock();
+-            tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
++            tb = tb_gen_code(cpu, pc, cs_base, flags, cflags, NULL, NULL);
+             mmap_unlock();
+         }
+ 
+@@ -1396,11 +1621,24 @@
+     target_ulong cs_base, pc;
+     uint32_t flags;
+     bool was_translated = false, was_chained = false;
++    BinvariantsTB *curtb_binvTB = NULL;
+ 
+     tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask);
+     if (tb == NULL) {
++        if (inCodeRange(pc)) {
++          for (uint16_t i = 0; i < *binv_id; i++) {
++            if (binvTB[i].pc == pc) {
++              curtb_binvTB = &binvTB[i];
++              break;
++            }
++          }
++        }
+         mmap_lock();
+-        tb = tb_gen_code(cpu, pc, cs_base, flags, cf_mask);
++        if (curtb_binvTB) {
++          tb = tb_gen_code(cpu, pc, cs_base, flags, cf_mask, NULL, curtb_binvTB);
++        } else {
++          tb = tb_gen_code(cpu, pc, cs_base, flags, cf_mask, NULL, NULL);
++        }
+         was_translated = true;
+         mmap_unlock();
+         /* We add the TB in the virtual pc hash table for the fast lookup */
+@@ -1420,9 +1658,9 @@
+         tb_add_jump(last_tb, tb_exit, tb);
+         was_chained = true;
+     }
+-    if (was_translated || was_chained) {
+-        afl_request_tsl(pc, cs_base, flags, cf_mask,
+-                        was_chained ? last_tb : NULL, tb_exit);
++    if ((was_translated || was_chained) && !curtb_binvTB) {
++        binv_request_tsl(pc, cs_base, flags, cf_mask,
++                        was_chained ? last_tb : NULL, tb_exit, cpu, tb);
+     }
+     return tb;
+ }
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/accel/tcg/internal.h qemuafl/accel/tcg/internal.h
+--- ../for_patch/qemuafl/accel/tcg/internal.h	2025-12-27 15:04:04.037941691 -0700
++++ qemuafl/accel/tcg/internal.h	2025-12-28 08:42:31.958602243 -0700
+@@ -13,7 +13,8 @@
+ 
+ TranslationBlock *tb_gen_code(CPUState *cpu, target_ulong pc,
+                               target_ulong cs_base, uint32_t flags,
+-                              int cflags);
++                              int cflags, void *binv_args_ptr,
++                              void *curtb_binvTB_ptr);
+ 
+ void QEMU_NORETURN cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
+ 
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/accel/tcg/tcg-runtime.c qemuafl/accel/tcg/tcg-runtime.c
+--- ../for_patch/qemuafl/accel/tcg/tcg-runtime.c	2025-12-27 15:04:04.037941691 -0700
++++ qemuafl/accel/tcg/tcg-runtime.c	2025-12-28 21:27:31.485250494 -0700
+@@ -34,6 +34,8 @@
+ 
+ #include "qemuafl/common.h"
+ 
++#include "Binvariants_qemu.h"
++
+ uint32_t afl_hash_ip(uint64_t);
+ 
+ void HELPER(afl_entry_routine)(CPUArchState *env) {
+@@ -983,3 +985,19 @@
+ #endif
+ 
+ }
++
++void HELPER(Binvariants_updateViolTBInvs)(CPUArchState *env, void *binvTB_ptr, void *cpu_ptr, void *cur_tb_ptr) { // TODO: replace env with tcg_ptr to env->regs?
++  BinvariantsTB *curtb_binvTB = (BinvariantsTB *)binvTB_ptr;
++  uint64_t *cur_reg_values = env->regs;
++
++  if (Binvariants_updateInvs_violTB(cur_reg_values, curtb_binvTB)) {
++    binv_request_update_invs(curtb_binvTB);
++  }
++
++  mmap_lock();
++  tb_phys_invalidate((TranslationBlock *)cur_tb_ptr, -1);
++  mmap_unlock();
++
++  cpu_loop_exit_restore((CPUState *)cpu_ptr, GETPC());
++
++}
+\ No newline at end of file
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/accel/tcg/tcg-runtime.h qemuafl/accel/tcg/tcg-runtime.h
+--- ../for_patch/qemuafl/accel/tcg/tcg-runtime.h	2025-12-27 15:04:04.037941691 -0700
++++ qemuafl/accel/tcg/tcg-runtime.h	2025-12-28 08:36:22.904762951 -0700
+@@ -356,3 +356,5 @@
+ DEF_HELPER_FLAGS_2(qasan_store8, TCG_CALL_NO_RWG, void, env, tl)
+ DEF_HELPER_FLAGS_1(qasan_shadow_stack_push, TCG_CALL_NO_RWG, void, tl)
+ DEF_HELPER_FLAGS_1(qasan_shadow_stack_pop, TCG_CALL_NO_RWG, void, tl)
++
++DEF_HELPER_FLAGS_4(Binvariants_updateViolTBInvs, TCG_CALL_NO_WG, void, env, ptr, ptr, ptr)
+\ No newline at end of file
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/accel/tcg/translate-all.c qemuafl/accel/tcg/translate-all.c
+--- ../for_patch/qemuafl/accel/tcg/translate-all.c	2025-12-27 15:04:04.038941699 -0700
++++ qemuafl/accel/tcg/translate-all.c	2025-12-28 18:12:32.294369574 -0700
+@@ -69,6 +69,8 @@
+ 
+ #include <math.h>
+ 
++#include "Binvariants_qemu.h"
++
+ __thread int cur_block_is_good;
+ 
+ static int afl_track_unstable_log_fd(void) {
+@@ -2017,7 +2019,8 @@
+ /* Called with mmap_lock held for user mode emulation.  */
+ TranslationBlock *tb_gen_code(CPUState *cpu,
+                               target_ulong pc, target_ulong cs_base,
+-                              uint32_t flags, int cflags)
++                              uint32_t flags, int cflags, void *binv_args_ptr,
++                              void *curtb_binvTB_ptr)
+ {
+     CPUArchState *env = cpu->env_ptr;
+     TranslationBlock *tb, *existing_tb;
+@@ -2073,6 +2076,8 @@
+     tb->cflags = cflags;
+     tb->trace_vcpu_dstate = *cpu->trace_dstate;
+     tcg_ctx->tb_cflags = cflags;
++    tb->acc_regs_array = NULL;
++    tb->acc_regs_cnt = 0;
+  tb_overflow:
+ 
+ #ifdef CONFIG_PROFILER
+@@ -2090,6 +2095,67 @@
+ 
+     tcg_ctx->cpu = env_cpu(env);
+     afl_gen_trace(pc);
++    if (binv_args_ptr || curtb_binvTB_ptr) {
++        BinvariantsTB *cur_binvTB = NULL;
++
++        struct binv_offsets bo;
++        bo.regs_offset = offsetof(CPUArchState, regs);
++        bo.stride = sizeof(((CPUArchState*)0)->regs[0]);
++        bo.viol_offset = offsetof(CPUArchState, viol);
++
++        if (binv_args_ptr) {
++            struct binv_args *ba = (struct binv_args *)binv_args_ptr;
++            cur_binvTB = &binvTB[ba->cur_binv_id];
++            if (cur_binvTB && cur_binvTB->pc == tb->pc) {
++                tb->binv_id = ba->cur_binv_id;
++
++                TCGLabel *L_ok = gen_new_label();
++
++                tcg_gen_st_i32(tcg_constant_i32(0), cpu_env, bo.viol_offset); // CPUX86State->viol = 0;
++
++                TCGv_i32 viol_res = tcg_temp_new_i32();
++                tcg_gen_movi_i32(viol_res, 0);
++
++                Binvariants_genInvsChecks_newTB(cur_binvTB, ba, &bo); // generate new inv checks
++                
++                tcg_gen_ld_i32(viol_res, cpu_env, bo.viol_offset); // viol_res = CPUX86State->viol;
++                tcg_gen_brcond_i32(TCG_COND_EQ, viol_res, tcg_constant_i32(0), L_ok); // if (viol_res == 0) goto L_ok;
++
++                gen_helper_Binvariants_updateViolTBInvs(cpu_env, tcg_const_ptr(cur_binvTB), \
++                                                tcg_const_ptr(cpu), tcg_const_ptr(tb)); // else, update invs
++
++                gen_set_label(L_ok);
++                tcg_temp_free_i32(viol_res);
++            }
++
++        } else if (curtb_binvTB_ptr) {
++            cur_binvTB = (BinvariantsTB *)curtb_binvTB_ptr;
++            if (cur_binvTB && cur_binvTB->pc == tb->pc) {
++
++                tb->binv_id = cur_binvTB->binv_id;
++
++                TCGLabel *L_ok = gen_new_label();
++
++                tcg_gen_st_i32(tcg_constant_i32(0), cpu_env, bo.viol_offset); // CPUX86State->viol = 0;
++
++                TCGv_i32 viol_res = tcg_temp_new_i32();
++                tcg_gen_movi_i32(viol_res, 0);
++
++                Binvariants_regenInvChecks_violTB(cur_binvTB, &bo); // generate updated inv checks
++                
++                tcg_gen_ld_i32(viol_res, cpu_env, bo.viol_offset); // viol_res = CPUX86State->viol;
++                tcg_gen_brcond_i32(TCG_COND_EQ, viol_res, tcg_constant_i32(0), L_ok); // if (viol_res == 0) goto L_ok;
++
++                gen_helper_Binvariants_updateViolTBInvs(cpu_env, tcg_const_ptr(cur_binvTB), \
++                                                tcg_const_ptr(cpu), tcg_const_ptr(tb)); // else, update invs
++
++                gen_set_label(L_ok);
++                tcg_temp_free_i32(viol_res);
++            }
++        }
++    } else {
++        tb->binv_id = 0;
++    }
+     gen_intermediate_code(cpu, tb, max_insns);
+     tcg_ctx->cpu = NULL;
+     max_insns = tb->icount;
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/accel/tcg/translator.c qemuafl/accel/tcg/translator.c
+--- ../for_patch/qemuafl/accel/tcg/translator.c	2025-12-27 15:04:04.038941699 -0700
++++ qemuafl/accel/tcg/translator.c	2025-12-27 16:55:42.052541317 -0700
+@@ -20,6 +20,7 @@
+ #include "sysemu/replay.h"
+ 
+ #include "qemuafl/common.h"
++#include "Binvariants_qemu.h"
+ 
+ /* Pairs with tcg_clear_temp_count.
+    To be called by #TranslatorOps.{translate_insn,tb_stop} if
+@@ -63,6 +64,7 @@
+     plugin_enabled = plugin_gen_tb_start(cpu, tb,
+                                          tb_cflags(db->tb) & CF_MEMI_ONLY);
+ 
++    BINVARIANTS_RECORD_REGS_SNIPPET1;
+     while (true) {
+         db->num_insns++;
+         ops->insn_start(db, cpu);
+@@ -134,6 +136,9 @@
+             ops->translate_insn(db, cpu);
+         }
+ 
++        /*  identify read registers in each instruction */
++        BINVARIANTS_RECORD_REGS_SNIPPET2;
++
+         /* Stop translation if translate_insn so indicated.  */
+         if (db->is_jmp != DISAS_NEXT) {
+             break;
+@@ -154,6 +159,7 @@
+             break;
+         }
+     }
++    BINVARIANTS_RECORD_REGS_SNIPPET3;
+ 
+     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
+     ops->tb_stop(db, cpu);
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/disas/capstone.c qemuafl/disas/capstone.c
+--- ../for_patch/qemuafl/disas/capstone.c	2025-12-27 15:04:04.044941747 -0700
++++ qemuafl/disas/capstone.c	2025-12-27 16:57:37.964361870 -0700
+@@ -324,3 +324,52 @@
+     cs_close(&handle);
+     return true;
+ }
++
++/****** Binvariants ******/
++csh binv_handle;
++cs_insn *binv_cap_insn;
++
++void Binvariants_cap_init(disassemble_info *info) {
++    cs_mode cap_mode = info->cap_mode;
++
++    cap_mode += (info->endian == BFD_ENDIAN_BIG ? CS_MODE_BIG_ENDIAN
++                 : CS_MODE_LITTLE_ENDIAN);
++
++    if (cs_open(info->cap_arch, cap_mode, &binv_handle) != CS_ERR_OK) {
++        fprintf(stderr, "ERROR: Failed to initialize Capstone\n");
++        exit(1);
++    }
++
++    cs_option(binv_handle, CS_OPT_SKIPDATA, CS_OPT_ON);
++
++    switch (info->cap_arch) {
++    case CS_ARCH_SYSZ:
++        cs_option(binv_handle, CS_OPT_SKIPDATA_SETUP,
++                  (uintptr_t)&cap_skipdata_s390x);
++        break;
++
++    case CS_ARCH_X86:
++        cs_option(binv_handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
++        break;
++    }
++
++    binv_cap_insn = cs_malloc(binv_handle);
++    if (binv_cap_insn == NULL) {
++        cs_close(binv_handle);
++        fprintf(stderr, "ERROR: Failed to malloc binv_cap_insn\n");
++        exit(1);
++    }
++}
++
++void *Binvariants_cap_disas(disassemble_info *info, uint64_t pc, size_t size) {
++    uint8_t cap_buf[32];
++    const uint8_t *cbuf = cap_buf;
++
++    assert(size < sizeof(cap_buf));
++    info->read_memory_func(pc, cap_buf, size, info);
++
++    cs_disasm_iter(binv_handle, &cbuf, &size, &pc, binv_cap_insn);
++
++    return binv_cap_insn;
++}
++/****** Binvariants ends ******/
+\ No newline at end of file
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/disas.c qemuafl/disas.c
+--- ../for_patch/qemuafl/disas.c	2025-12-27 15:04:04.043941739 -0700
++++ qemuafl/disas.c	2025-12-27 16:59:01.610571499 -0700
+@@ -298,6 +298,22 @@
+     return g_string_free(ds, false);
+ }
+ 
++/****** Binvariants ******/
++CPUDebug binv_s;
++
++void Binvariants_initDisas(CPUState *cpu) {
++    initialize_debug_target(&binv_s, cpu);
++    Binvariants_cap_init(&binv_s.info);
++}
++
++void *Binvariants_disas(uint64_t addr, size_t size) {
++    binv_s.info.buffer_vma = addr;
++    binv_s.info.buffer_length = size;
++    
++    return Binvariants_cap_disas(&binv_s.info, addr, size);
++}
++/****** Binvariants ends ******/
++
+ /* Disassemble this for me please... (debugging). */
+ void disas(FILE *out, const void *code, unsigned long size)
+ {
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/include/disas/disas.h qemuafl/include/disas/disas.h
+--- ../for_patch/qemuafl/include/disas/disas.h	2025-12-27 15:04:04.072941970 -0700
++++ qemuafl/include/disas/disas.h	2025-12-28 08:09:08.422110496 -0700
+@@ -16,6 +16,9 @@
+ 
+ char *plugin_disas(CPUState *cpu, uint64_t addr, size_t size);
+ 
++void Binvariants_initDisas(CPUState *cpu);
++void *Binvariants_disas(uint64_t addr, size_t size);
++
+ /* Look up symbol for debugging purpose.  Returns "" if unknown. */
+ const char *lookup_symbol(target_ulong orig_addr);
+ #endif
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/include/disas/dis-asm.h qemuafl/include/disas/dis-asm.h
+--- ../for_patch/qemuafl/include/disas/dis-asm.h	2025-12-27 15:04:04.072941970 -0700
++++ qemuafl/include/disas/dis-asm.h	2025-12-28 08:08:40.083609993 -0700
+@@ -466,6 +466,8 @@
+ bool cap_disas_host(disassemble_info *info, const void *code, size_t size);
+ bool cap_disas_monitor(disassemble_info *info, uint64_t pc, int count);
+ bool cap_disas_plugin(disassemble_info *info, uint64_t pc, size_t size);
++void Binvariants_cap_init(disassemble_info *info);
++void *Binvariants_cap_disas(disassemble_info *info, uint64_t pc, size_t size);
+ #else
+ # define cap_disas_target(i, p, s)  false
+ # define cap_disas_host(i, p, s)    false
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/include/exec/exec-all.h qemuafl/include/exec/exec-all.h
+--- ../for_patch/qemuafl/include/exec/exec-all.h	2025-12-27 15:04:04.072941970 -0700
++++ qemuafl/include/exec/exec-all.h	2025-12-28 08:06:58.588826868 -0700
+@@ -450,6 +450,9 @@
+     uint32_t flags; /* flags defining in which context the code was generated */
+     uint16_t size;      /* size of target code for this block (1 <=
+                            size <= TARGET_PAGE_SIZE) */
++    uint16_t binv_id;
++    uint8_t *acc_regs_array;
++    uint8_t acc_regs_cnt;
+     uint16_t icount;
+     uint32_t cflags;    /* compile flags */
+ #define CF_COUNT_MASK  0x00007fff
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/linux-user/main.c qemuafl/linux-user/main.c
+--- ../for_patch/qemuafl/linux-user/main.c	2025-12-27 15:04:03.863940306 -0700
++++ qemuafl/linux-user/main.c	2025-12-28 08:03:52.853536467 -0700
+@@ -51,6 +51,8 @@
+ 
+ #include "qemuafl/qasan-qemu.h"
+ 
++#include "Binvariants_qemu.h"
++
+ char *exec_path;
+ 
+ int singlestep;
+@@ -981,6 +983,7 @@
+         }
+         gdb_handlesig(cpu, 0);
+     }
++    start_init_qemu = info->start_code;
+     cpu_loop(env);
+     /* never exits */
+     return 0;
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/linux-user/meson.build qemuafl/linux-user/meson.build
+--- ../for_patch/qemuafl/linux-user/meson.build	2025-12-27 15:04:03.863940306 -0700
++++ qemuafl/linux-user/meson.build	2025-12-28 08:02:28.745985439 -0700
+@@ -11,6 +11,8 @@
+   'syscall.c',
+   'uaccess.c',
+   'uname.c',
++  'Binvariants_common.c',
++  'Binvariants_qemu.c',
+ ))
+ linux_user_ss.add(rt)
+ 
+diff -ruN '--exclude=.git' '--exclude=.vscode' ../for_patch/qemuafl/target/i386/cpu.h qemuafl/target/i386/cpu.h
+--- ../for_patch/qemuafl/target/i386/cpu.h	2025-12-27 15:04:03.894940553 -0700
++++ qemuafl/target/i386/cpu.h	2025-12-28 08:01:51.769303714 -0700
+@@ -1398,6 +1398,7 @@
+ } HVFX86LazyFlags;
+ 
+ typedef struct CPUX86State {
++    uint32_t viol;
+     /* standard registers */
+     target_ulong regs[CPU_NB_REGS];
+     target_ulong eip;

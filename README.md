@@ -2,7 +2,7 @@
 
 <!-- TO-DO: logo -->
 
-This repository provides the source code for `Binvariants`: a prototype fuzzing framework that leverages register-level likely invariant violations for fuzzing binaries.
+This repository provides the source code for **Binvariants**: a prototype fuzzing framework that leverages register-level likely invariant violations for fuzzing binaries.
 
 This work is presented in our paper [**Binvariants: Enhancing Fuzzing of Closed-source Binary Executables via Register-level Likely Invariants**](https://futures.cs.utah.edu/papers/XXX), appearing in the 2026 ACM International Conference on the Foundations of Software Engineering (FSE’26).
 
@@ -52,8 +52,8 @@ sudo apt-get install -y meson ninja-build # for QEMU mode
 
 
 Binvariants include two components:
-* [`1-Invariant_Learner/`](1-Invariant_Learner/README.md)
-* [`2-Fuzzer/`](1-Fuzzer/README.md)
+* [1-Invariant_Learner/](1-Invariant_Learner/README.md)
+* [2-Fuzzer/](1-Fuzzer/README.md)
 
 To build each, navigate to their corresponding directory and run the following commands:
 
@@ -64,7 +64,7 @@ To build each, navigate to their corresponding directory and run the following c
 
 
 # Using Binvariants
-[`Example/`](Example/README.md) contains the example scripts and test cases for using `Binvariants` to fuzz [`nconvert`](https://www.xnview.com/en/nconvert/) binary. You can modify the scripts to fuzz other binaries.
+[Example/](Example/README.md) contains the example scripts and test cases for using `Binvariants` to fuzz [nconvert](https://www.xnview.com/en/nconvert/) binary. You can modify the scripts to fuzz other binaries.
 ## Setup
 Before using Binvariants, disable `ASLR`, as it needs consistent basic block addresses between invariant learning and fuzzing:
 ```
@@ -78,7 +78,7 @@ To learn invariants, run:
 ```
 ./Example/1-learn_invs.sh [Binvariants_Root]
 ```
-The inferred RLIs will be saved in the directory specified by `BIV_TRACES_DIR` in [`1-learn_invs.sh`](./Example/1-learn_invs.sh), named: `[PROGRAM]_trace_qemu_invs`.
+The inferred RLIs will be saved in the directory specified by `BINV_TRACES_DIR` in [1-learn_invs.sh](./Example/1-learn_invs.sh), named: `[PROGRAM]_trace_qemu_invs`.
 
 
 ## Fuzzing with RLIs
@@ -97,6 +97,11 @@ Below are potential enhancements to Binvariants.
 
 ### Adaptively Learning Invariants
 Currently, Binvariants learns invariants before fuzzing and then runs fuzzing separately. A possible enhancement is to learn invariants during fuzzing and update them as violations occur, allowing feedback to evolve over time.
+
+Possible design considerations:
+1. If invariants are updated during the execution of a test case that later crashes or times out, the update may need to be reverted. A practical solution is to apply updates to a copy of the invariants and commit them only if the test case completes normally (i.e, `FSRV_RUN_OK`).
+2. As fuzzing runs and invariants are updated, violations will naturally become less frequent. This risks AFL++ repeatedly selecting early-stage test cases (which trigger more violations but represent less-evolved program states). A [weight/perf_score/top_rated](https://github.com/AFLplusplus/AFLplusplus/blob/stable/src/afl-fuzz-queue.c) adjustment on AFL++ side may be needed to ensure that later, more representative test cases are selected.
+
 
 ### Cross-Basic-Block Invariants
 Binvariants currently focuses on single-block invariants. A potential enhancement is supporting cross-block invariants. It requires new data structures to track register values across block boundaries, as well as additional instrumentation to check violations when control transfers between blocks.

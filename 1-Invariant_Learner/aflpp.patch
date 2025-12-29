@@ -1,0 +1,49 @@
+diff -ruN ../for_patch/AFLplusplus-4.21c/GNUmakefile AFLplusplus-4.21c/GNUmakefile
+--- ../for_patch/AFLplusplus-4.21c/GNUmakefile	2025-12-27 15:03:58.126895037 -0700
++++ AFLplusplus-4.21c/GNUmakefile	2025-12-27 15:09:07.059316973 -0700
+@@ -474,8 +474,14 @@
+ afl-fuzz: $(COMM_HDR) include/afl-fuzz.h $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o src/hashmap.c | test_x86
+ 	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) -Wno-shift-count-overflow $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o src/hashmap.c -o $@ $(PYFLAGS) $(LDFLAGS) -lm
+ 
+-afl-showmap: src/afl-showmap.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o $(COMM_HDR) | test_x86
+-	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) src/$@.c src/afl-fuzz-mutators.c src/afl-fuzz-python.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(PYFLAGS) $(LDFLAGS)
++src/Binvariants_common.o: $(COMM_HDR) src/Binvariants_common.c include/Binvariants_common.h
++	$(CC) $(CFLAGS) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) -c src/Binvariants_common.c -o src/Binvariants_common.o
++ 
++src/Binvariants_aflpp.o: $(COMM_HDR) src/Binvariants_aflpp.c include/Binvariants_aflpp.h
++	$(CC) $(CFLAGS) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) -c src/Binvariants_aflpp.c -o src/Binvariants_aflpp.o
++ 
++afl-showmap: src/afl-showmap.c src/afl-common.o src/afl-sharedmem.o src/Binvariants_aflpp.o src/Binvariants_common.o src/afl-forkserver.o src/afl-performance.o $(COMM_HDR) | test_x86
++	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) src/$@.c src/afl-fuzz-mutators.c src/afl-fuzz-python.c src/afl-common.o src/afl-sharedmem.o src/Binvariants_aflpp.o src/Binvariants_common.o src/afl-forkserver.o src/afl-performance.o -o $@ $(PYFLAGS) $(LDFLAGS)
+ 
+ afl-tmin: src/afl-tmin.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o $(COMM_HDR) | test_x86
+ 	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) src/$@.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(LDFLAGS)
+diff -ruN ../for_patch/AFLplusplus-4.21c/src/afl-showmap.c AFLplusplus-4.21c/src/afl-showmap.c
+--- ../for_patch/AFLplusplus-4.21c/src/afl-showmap.c	2025-12-27 15:03:58.136895115 -0700
++++ AFLplusplus-4.21c/src/afl-showmap.c	2025-12-28 13:41:11.418019852 -0700
+@@ -63,6 +63,7 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/resource.h>
++#include "Binvariants_aflpp.h"
+ 
+ static afl_state_t *afl;
+ 
+@@ -1485,6 +1486,8 @@
+ 
+   }
+ 
++  bool binv_init = Binvariants_aflpp_init(use_argv[2]);
++
+   afl = calloc(1, sizeof(afl_state_t));
+ 
+   if (getenv("AFL_FORKSRV_INIT_TMOUT")) {
+@@ -1808,6 +1811,8 @@
+ 
+   afl_fsrv_deinit(fsrv);
+ 
++  if (binv_init) Binvariants_aflpp_deinit();
++
+   if (stdin_file) { ck_free(stdin_file); }
+   if (collect_coverage) { free(coverage_map); }
+ 

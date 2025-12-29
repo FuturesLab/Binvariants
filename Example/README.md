@@ -1,8 +1,8 @@
 ### Binvariants - Example
 
-This directory contains the example scripts and test cases for fuzzing [`nconvert`](https://www.xnview.com/en/nconvert/) with `Binvariants`. You can modify the scripts to fuzz other binaries.
+This directory contains the example scripts and test cases for fuzzing [nconvert](https://www.xnview.com/en/nconvert/) with `Binvariants`. You can modify the scripts to fuzz other binaries.
 
-`testcases.tar.gz` includes the initial seed used for a 24-hour AFL++ run of nconvert, as well as the test cases saved during the run. The saved test cases are used both for invariant learning and for fuzzing.
+`testcases.tar.gz` includes the initial seed used for a 24-hour AFL++ run of nconvert under QEMU mode, as well as the test cases saved during the run. The saved test cases are used both for invariant learning and for fuzzing.
 
 #### Descriptions:
 ```
@@ -11,7 +11,7 @@ Example/
    ├───── ./1-learn_invs.sh
    │       ├── PROGRAM: the binary name
    │       │
-   │       ├── BIVSHOWMAP: the path to `afl-showmap` of Binvariants' Invariant Learner
+   │       ├── BINVSHOWMAP: the path to `afl-showmap` of Binvariants' Invariant Learner
    │       │
    │       ├── PROGRAM_PATH: the path to the target binary
    │       │
@@ -19,7 +19,11 @@ Example/
    │       │
    │       ├── PROGRAM_CMD: the execution command of the binary
    │       │
-   │       └── BIV_TRACES_DIR: the folder for saving inferred invariants    
+   │       ├── BINV_AFL_TRACE_FILE_ENV: the path to Binvariants' AFL++ side logging file
+   │       │
+   │       ├── BINV_QEMU_TRACE_FILE_ENV: the path Binvariants' QEMU side logging file; used to construct the saved invariants file
+   │       │
+   │       └── BINV_TRACES_DIR: the folder for saving inferred invariants    
    │       
    └───── ./2-fuzz.sh      
            ├── OUT_ROOT_DIR: the path to fuzzing output root directory

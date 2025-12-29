@@ -1,22 +1,19 @@
-BINVARIANTS_ROOT=$1
+BINVARIANTS_ROOT="$(realpath "$1")"
 FUZZ_TIME=$2
 TRIAL=$3
 
 #*********************** nconvert ****************************
 
 OUT_ROOT_DIR=$BINVARIANTS_ROOT/Example/fuzzout/
-AFLFUZZ=$BINVARIANTS_ROOT/Binvariants/AFLplusplus-4.21c/afl-fuzz
+AFLFUZZ=$BINVARIANTS_ROOT/2-Fuzzer/build/AFLplusplus-4.21c/afl-fuzz
 
 PROGRAM=nconvert
 PROGRAM_PATH=$BINVARIANTS_ROOT/Example/$PROGRAM
 FUZZ_OUT=$OUT_ROOT_DIR/trial$TRIAL/$PROGRAM
 
-export INVS_AFL_TRACE_FILE_ENV=$FUZZ_OUT/trace_afl
-export INVS_QEMU_TRACE_FILE_ENV=$FUZZ_OUT/trace_qemu
-
 export SAVED_INVS_FILE_ENV=$BINVARIANTS_ROOT/Example/traces/$PROGRAM\_trace_qemu_invs
 
-PROGRAM_CMD="$PROGRAM_PATH -out tiff -o /tmp/tmp.tif @@"
+PROGRAM_CMD="$PROGRAM_PATH -overwrite -out tiff -o /tmp/tmp.tif @@"
 
 TESTCASE_DIR=$BINVARIANTS_ROOT/Example/24h_queued/
 
