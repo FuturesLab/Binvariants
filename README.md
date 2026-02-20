@@ -1,6 +1,6 @@
 # Binvariants: Register-Level Invaraint-Guided Fuzzing for Binaries
 
-<!-- TO-DO: logo -->
+<img align="right" src=".logo.png" alt="Binvariants logo" width="220" height="220"/>
 
 This repository provides the source code for **Binvariants**: a prototype fuzzing framework that leverages register-level likely invariant violations for fuzzing binaries.
 
@@ -12,7 +12,8 @@ This work is presented in our paper [**Binvariants: Enhancing Fuzzing of Closed-
 * [Bug Trophy Case](#bug-trophy-case)
 
 
-<!-- TO-DO: workflow figure -->
+<br><img align="center" src=".binvariants1.png" alt="Binvariants workflow" width="100%"/>
+<br><img align="center" src=".binvariants2.png" alt="Binvariants workflow" width="100%"/>
 
 <table>
   <tr>
@@ -124,3 +125,4 @@ Binvariants currently focuses on single-block invariants. A potential enhancemen
 If you find any other bugs using Binvariants, please let us know!
 
 # Acknowledgement
+This material is based upon work supported by the National Science Foundation (NSF) under Award No. 2419798, and by the Defense Advanced Research Projects Agency (DARPA) under Award No. FA8750-24-2-0002, Subaward No. GR105409-SUB00001384. 
