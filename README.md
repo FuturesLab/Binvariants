@@ -4,7 +4,7 @@
 
 This repository provides the source code for **Binvariants**: a prototype fuzzing framework that leverages register-level likely invariant violations for fuzzing binaries.
 
-This work is presented in our paper [**Binvariants: Enhancing Fuzzing of Closed-source Binary Executables via Register-level Likely Invariants**](https://futures.cs.utah.edu/papers/XXX), appearing in the 2026 ACM International Conference on the Foundations of Software Engineering (FSE’26).
+This work is presented in our paper [**Binvariants: Enhancing Fuzzing of Closed-source Binary Executables via Register-level Likely Invariants**](https://futures.cs.utah.edu/papers/26FSE-c.pdf) | [Slides](https://futures.cs.utah.edu/papers/26FSE-c_slides.pdf), appearing in the 2026 ACM International Conference on the Foundations of Software Engineering (FSE’26).
 
 * [Installing Binvariants](#installing-binvariants)
 * [Using Binvariants](#using-binvariants)
