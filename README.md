@@ -19,7 +19,7 @@ This work is presented in our paper [**Binvariants: Enhancing Fuzzing of Closed-
   <tr>
     <td><b>Citing this repository:</b></td>
     <td>
-      <code class="rich-diff-level-one">@inproceedings{yang:binvariants, title = {Binvariants: Enhancing Fuzzing of Closed-source Binary Executables via Register-level Likely Invariants}, author = {Zao Yang and Stefan Nagy}, year = {2026}, issue_date = {July 2026}, publisher = {Association for Computing Machinery}, address = {New York, NY, USA}, volume = {3}, number = {FSE}, journal = {Proc. ACM Softw. Eng.}}</code>
+      <code class="rich-diff-level-one">@article{yang:binvariants, title = {Binvariants: Enhancing Fuzzing of Closed-source Binary Executables via Register-level Likely Invariants}, author = {Zao Yang and Stefan Nagy}, year = {2026}, issue_date = {July 2026}, publisher = {Association for Computing Machinery}, address = {New York, NY, USA}, volume = {3}, number = {FSE}, journal = {Proc. ACM Softw. Eng.}}</code>
     </td>
   </tr>
   <tr>
